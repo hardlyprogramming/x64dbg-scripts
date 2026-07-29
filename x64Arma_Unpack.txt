@@ -1,0 +1,235 @@
+//Written by hardlyprogramming
+//Armadillo v6.xx - 9.xx : redirect NOP -> CRC/IAT wait -> OEP finder  (x64)
+//Run from entry point (or directly after the redirect finder).
+//
+//Registers use cip/csp (arch-neutral: cip=rip, csp=rsp on x64).
+//The only x64-specific bytes are the redirect pattern (REX.W 0x48 prefix)
+//and, if your sample uses a 64-bit test, the CRC pattern.
+
+
+//===========================================================================
+// 1. REDIRECT FINDER
+//===========================================================================
+
+bp VirtualProtect
+erun
+bc VirtualProtect
+bp LoadLibraryA
+erun
+my_lib = cip
+
+Back_In_Load_Lib:
+rtr
+sti
+rtr
+
+cmp cip, my_lib
+je Back_In_Load_Lib
+sti
+
+// x64 redirect check: cmp qword ptr [reg+disp32], 0  ->  48 83 /7 ModRM disp32 00
+//   common form, base in a normal reg (no SIB), ModRM = B8..BF except BC:
+//     48 83 B? <disp32(4)> 00   -> 4 wildcards after B?
+find cip, "E9 ?? ?? ?? ?? 48 83 B? ?? ?? ?? ?? 00"
+//   SIB form, base = rsp/r12 (ModRM = BC, adds a SIB byte):
+//     48 83 BC <SIB(1)> <disp32(4)> 00   -> 5 wildcards
+//find cip, "E9 ?? ?? ?? ?? 48 83 BC ?? ?? ?? ?? ?? 00"
+//   32-bit original (no REX):
+//find cip, "E9 ?? ?? ?? ?? 83 B? ?? ?? ?? ?? 00"
+cmp $result, 0
+jne set_break
+
+erun
+cmp cip, my_lib
+je Back_In_Load_Lib
+erun
+jmp Back_In_Load_Lib
+
+set_break:
+possible_loc = $result
+bp $result
+erun
+cmp cip, possible_loc
+je found
+bc possible_loc
+cmp cip, my_lib
+je Back_In_Load_Lib
+erun
+cmp cip, my_lib
+je Back_In_Load_Lib
+msg "Something went Wrong"
+ret
+
+found:
+bc my_lib
+msg "Found patch location at {p:possible_loc}.  NOPing the 'jne' instruction"
+find cip, "75 ??"
+cmp $result, 0
+je ERROR_PATCHING
+//saving the current bytes and address in order to restore later
+bytes_to_restore = 2:[$result]
+address_to_restore = $result
+// patching the redirect with NOP (jne is 2 bytes on x86 and x64)
+2:[$result] = 9090
+log "address to restore = {p:address_to_restore}"
+
+bc
+bp address_to_restore
+
+
+//===========================================================================
+// 2. CRC / IAT WAIT
+//    - find every "test / jne+5 / jmp" guard in the current page
+//    - run: the FIRST one that fires after the patch is our target
+//    - lock it, drop the rest, then watch ITS zero flag until it sets
+//===========================================================================
+
+//This searches for potential CRC check loops.
+//CRC values are usually 32-bit, so the test has no REX: 85 ?? 75 05 E9
+findall mem.base(cip), "85 ?? 75 05 E9"
+//64-bit test variant (guard uses "test rXX, rXX" -> 48 85 ..):
+//findall mem.base(cip), "48 85 ?? 75 05 E9"
+
+count = ref.count()
+cmp count, 0
+je no_crc_found                       // nothing to watch -> straight to OEP
+
+// --- set a breakpoint on every candidate ---
+i = 0
+set_breakpoints:
+    addr = ref.addr(i)
+    bp addr
+    log "CRC candidate {d:i} @ {p:addr}"
+    i++
+    cmp i, count
+    jne set_breakpoints
+log "{d:count} CRC candidate breakpoints set"
+
+crc_location = 0
+
+// --- Phase 1: run until the FIRST candidate fires ---
+find_first_hit:
+    erun
+    hit = $breakpointexceptionaddress
+    log "Break @ {p:hit}"
+
+    i = 0
+identify_hit:
+    addr = ref.addr(i)
+    cmp hit, addr
+    je lock_crc
+    i++
+    cmp i, count
+    jne identify_hit
+    // hit was NOT a candidate (e.g. the patched jne bp) -> keep running
+    jmp find_first_hit
+
+lock_crc:
+    crc_location = hit
+    log "Locked CRC location @ {p:crc_location}"
+    // Critical: drop ALL other breakpoints so only THIS address can fire.
+    // Without this, other candidates would poison the zero-flag check.
+    bc
+    bp crc_location
+
+// --- Phase 2: watch only crc_location, wait for ZF == 1 ---
+watch_crc:
+    erun                              // returns to crc_location (it loops)
+    sti                               // execute the TEST so ZF is meaningful
+    cmp _zf, 1
+    jne watch_crc
+
+    log "Zero flag caught - IAT should be fully written"
+    log "Restoring bytes"
+restore_bytes:
+    2:[address_to_restore] = bytes_to_restore
+    // verify by read-back (memory assignment does not set $result)
+    cmp 2:[address_to_restore], bytes_to_restore
+    jne FAILED_RESTORE
+    log "Bytes restored"
+    bc
+    log "Breakpoints cleared"
+    msg "CRC handling finished"
+    jmp Find_OEP
+
+no_crc_found:
+    log "No CRC pattern found - skipping to OEP finder"
+    bc
+    jmp Find_OEP
+
+
+//===========================================================================
+// 3. OEP FINDER  (Armadillo v6.xx - 9.xx)
+//===========================================================================
+
+Find_OEP:
+
+bp CreateThread
+erun
+set my_1, cip
+
+In_CreateThread:
+my_2 = [csp]
+bp [csp]
+erun
+rtr
+
+Check_CreateThread:
+cmp cip, my_1
+je Missed_Break
+bc my_2
+sti
+
+look_for_magic_call:
+find cip, "FF D?"
+cmp $result, 0
+je Not_Found
+
+find $result+1, "FF D?"
+cmp $result, 0
+je Not_Found
+set my_2, $result
+bp $result
+
+erun
+cmp cip, my_2
+je Found_Oep
+
+
+Missed_Break:
+bc my_2
+cmp cip, my_1
+je In_CreateThread
+erun
+jmp In_CreateThread
+
+
+Not_Found:
+bc my_2
+erun
+cmp cip, my_1
+je In_CreateThread
+msg "Couldn't find the OEP"
+ret
+
+
+Found_Oep:
+bc
+sti
+cmt cip, "<--- OEP is Here"
+bph cip
+msg "Found OEP @ {p:cip} and commented the address :]"
+ret
+
+
+//===========================================================================
+// ERROR HANDLERS
+//===========================================================================
+
+FAILED_RESTORE:
+msg "Failed when restoring bytes..."
+ret
+
+ERROR_PATCHING:
+msg "Error while patching the 'jne'"
+ret

@@ -1,0 +1,57 @@
+//Written by hardlyprogramming
+
+erun
+bp CreateThread
+erun
+set my_1, eip
+
+In_CreateThread:
+my_2 = [esp]
+bp [esp]
+erun
+rtr
+
+Check_CreateThread:
+cmp eip, my_1
+je Missed_Break
+bc my_2
+sti
+
+look_for_magic_call:
+find eip, "FF D?"
+cmp $result, 0
+je Not_Found
+
+find $result+1, "FF D?"
+cmp $result, 0
+je Not_Found
+set my_2, $result
+bp $result
+
+erun
+cmp eip, my_2
+je Found_Oep
+
+
+Missed_Break:
+bc my_2
+cmp eip, my_1
+je In_CreateThread
+erun
+jmp In_CreateThread
+
+
+Not_Found:
+bc my_2
+erun
+cmp eip, my_1
+je In_CreateThread
+msg "Couldn't find the OEP"
+ret
+
+Found_Oep:
+bc
+sti
+cmt eip, "<--- OEP is Here"
+bph eip
+msg "Found OEP @ {eip} and Commented the Address :]

@@ -1,0 +1,51 @@
+//Written by hardlyprogramming
+
+bp VirtualProtect
+erun
+bc VirtualProtect
+bp LoadLibraryA
+erun
+my_lib = eip
+
+Back_In_Load_Lib:
+rtr
+sti
+rtr
+
+cmp eip, my_lib
+je Back_In_Load_Lib
+sti
+
+//32bit
+//find cip, "E9 ?? ?? ?? ?? 83 B? ?? ?? ?? ?? 00"
+//cmp $result, 0
+//jne set_break
+
+//64bit
+find cip, "E9 ?? ?? ?? ?? 48 83 B? ?? ?? ?? ?? ?? 00"
+cmp $result, 0
+jne set_break
+
+
+erun
+cmp eip, my_lib
+je Back_In_Load_Lib
+erun
+jmp Back_In_Load_Lib
+set_break:
+possible_loc = $result
+bp $result
+erun
+cmp eip, possible_loc
+je found
+bc possible_loc
+cmp eip, my_lib
+je Back_In_Load_Lib
+erun
+cmp eip, my_lib
+je Back_In_Load_Lib
+msg "Some ting Wong"
+ret
+
+found:
+msg "Found patch location at {possible_loc}.  NOP the 'je' instruction"
