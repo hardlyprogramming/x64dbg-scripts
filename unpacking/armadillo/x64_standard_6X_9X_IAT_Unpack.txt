@@ -1,0 +1,261 @@
+////////////////////////////////////////////////////////////////////////////////
+// RFIND (x64) - Armadillo IAT-redirect fixer + CRC/IAT-wait detector + OEP finder
+//
+// 64-bit variant of RFIND. Uses cip/csp (architecture-neutral "current"
+// registers) so the register side is portable; the byte patterns below are the
+// x64 forms and are the parts to verify against your specific build.
+//
+// Phase 1  : reach the loader's import-resolution code
+// Phase 1a : poll across LoadLibraryA calls until the redirect stubs exist,
+//            then breakpoint each stub's conditional jump
+// Phase 1b : run until the first stub jne fires -> that is the live redirect
+// Phase 1c : find every CRC / IAT-wait guard, breakpoint each one
+// Phase 1d : dispatch loop -
+//              - stopped at the redirect jne -> force ZF=1 so it falls through
+//              - stopped at a CRC guard      -> step the test, read ZF;
+//                                               ZF == 1 means the IAT is written
+//            (if no CRC guard exists, fall back to CreateThread as the signal)
+// Phase 1e : IAT complete -> keep only CreateThread, run on to it
+// Phase 2  : walk from CreateThread to the original entry point (OEP)
+//
+// ==== VERIFY THESE ON YOUR x64 TARGET ====
+//   1. Stub jne offset is +0xE below (14-byte prefix: REX.W 48 + wide disp).
+//      Single-step at a stub bp and confirm you land on a 75. If the real stub
+//      is one byte shorter, change 0xE to 0xD so pattern and offset agree.
+//   2. CRC guard pattern is "85 ?? 75 05 E9" (32-bit test). If the guard tests
+//      a 64-bit register, prepend 48 -> "48 85 ?? 75 05 E9". No offset change.
+//   3. OEP call pattern "FF D?" catches call rax..rdi only. For r8..r15 it is
+//      "41 FF D?".
+//
+// Build notes:
+//   - Only je / jne / jz / jnz / jmp are accepted for branching.
+//   - Flags are written directly (_ZF = 1) and read directly (cmp _zf, 1).
+//   - Hex literals are prefixed with 0x.
+////////////////////////////////////////////////////////////////////////////////
+
+
+//============================================================================
+// Phase 1 - reach the loader's import-resolution code
+//============================================================================
+bp VirtualProtect
+erun
+bc
+
+
+//============================================================================
+// Phase 1a - poll until the redirect stubs exist, then breakpoint each jne
+//============================================================================
+// x64 stub shape:
+//   E9 ?? ?? ?? ??              jmp <redirect>
+//   48 83 B? ?? ?? ?? ?? ?? 00   cmp qword ptr [reg+disp], 0   (REX.W = 48)
+//   75 ??                       jne <take redirect>   <- jne sits 0xE past E9
+//
+// The trailing "75" confirms the jne. Once you see the constant offset byte
+// (the x64 equivalent of the x86 "44"), tighten "75" to "75 XX" to drop
+// coincidental matches, just like the 32-bit script.
+//
+// One LoadLibraryA is often too early: Armadillo builds the stubs as imports
+// resolve across several library loads, so a scan right after the first load
+// can come back empty. On each miss, run on to the next LoadLibraryA and scan
+// again. scan_attempts is only a runaway guard.
+bp LoadLibraryA
+scan_attempts = 0
+
+find_stubs:
+log "no pattern found yet scan: {scan_attempts}"
+erun
+rtr
+sti
+cmp scan_attempts, 200
+je no_stubs_found
+scan_attempts = scan_attempts + 0x1
+
+// guard: if cip is null, gives error
+region = mem.base(cip)
+cmp region, 0
+je find_stubs 
+
+findall mem.base(cip), "E9 ?? ?? ?? ?? 48 83 B? ?? ?? ?? ?? ?? 00 75 4e"
+cmp $result, 0
+je find_stubs
+
+// stubs found -> drop LoadLibraryA and breakpoint every candidate jne
+bc
+stub_count = $result
+idx = 0
+
+arm_stub_bps:
+cmp idx, stub_count
+je run_to_live_stub
+match_addr = ref.addr(idx)
+jne_addr = match_addr + 0xE
+bp jne_addr
+idx = idx + 0x1
+jmp arm_stub_bps
+
+
+//============================================================================
+// Phase 1b - lock onto the live redirect jne
+//============================================================================
+run_to_live_stub:
+erun
+redirect_jne = cip
+log "Live redirect jne @ {p:redirect_jne}"
+
+// Keep only the live jne; drop the other candidates.
+bc
+bp redirect_jne
+
+
+//============================================================================
+// Phase 1c - find every CRC / IAT-wait guard and breakpoint it
+//============================================================================
+// Guard shape (see note 2 if this misses on x64):
+//   85 ??                   test reg, reg     <- breakpoint here (start of match)
+//   75 05                   jne +5
+//   E9 ?? ?? ?? ??          jmp <keep waiting>
+findall mem.base(cip), "85 ?? 75 05 E9"
+cmp $result, 0
+je no_crc_guard            // no guard found -> use CreateThread as the signal
+
+crc_count = $result
+idx = 0
+crc_locked = 0             // init before the loop so the je below cannot skip it
+
+arm_crc_bps:
+cmp idx, crc_count
+je iat_dispatch
+crc_addr = ref.addr(idx)
+bp crc_addr
+idx = idx + 0x1
+jmp arm_crc_bps
+
+
+//============================================================================
+// Phase 1d - dispatch: force redirects, watch the CRC guard for "IAT written"
+//============================================================================
+// On entry we are stopped at the live redirect jne (from Phase 1b).
+// Only two kinds of breakpoint are live here: the redirect jne, and CRC guards.
+
+iat_dispatch:
+cmp cip, redirect_jne
+jne crc_hit
+
+// --- redirect jne: force the compare to look "equal" so the jne falls through.
+//     ZF is written AFTER the cmp above (which we don't care about) and BEFORE
+//     the jne executes on the next erun.
+_ZF = 1
+erun
+jmp iat_dispatch
+
+crc_hit:
+// The first CRC guard to fire is the live one. Lock it and drop the siblings,
+// otherwise a different guard could execute and poison the zero-flag read.
+cmp crc_locked, 0
+jne crc_read_zf
+crc_location = cip
+crc_locked = 1
+bc
+bp redirect_jne
+bp crc_location
+log "Locked CRC guard @ {p:crc_location}"
+
+crc_read_zf:
+sti                        // execute the test so ZF reflects the actual check
+cmp _zf, 1
+je iat_complete            // ZF set -> IAT is fully written
+erun
+jmp iat_dispatch
+
+
+//============================================================================
+// Phase 1e - IAT complete: keep only CreateThread, then run on to it
+//============================================================================
+iat_complete:
+log "CRC zero flag caught - IAT should be fully written"
+bc
+bp CreateThread
+erun                       // run on to the thread-creation site
+jmp oep_walk_start
+
+
+//----------------------------------------------------------------------------
+// Fallback: no CRC guard was found. Force the redirect until CreateThread
+// fires, exactly like the original CreateThread-signaled loop.
+//----------------------------------------------------------------------------
+no_crc_guard:
+log "No CRC guard found - using CreateThread as the IAT-done signal"
+bp CreateThread
+
+force_zf_loop:
+_ZF = 1
+erun
+cmp cip, redirect_jne
+je force_zf_loop
+// not the jne -> CreateThread fired -> IAT done, and we are already sitting on it
+
+
+//============================================================================
+// Phase 2 - from CreateThread, walk to the original entry point
+//============================================================================
+oep_walk_start:
+log "At CreateThread - searching for OEP"
+ct_entry = cip                  // CreateThread entry - used as a re-sync landmark
+
+walk_from_ct:
+watch_addr = [csp]             // return address into the caller of CreateThread
+bp watch_addr
+erun                           // run back up to that caller
+rtr                            // return out of the caller
+
+check_return:
+cmp cip, ct_entry              // did we loop straight back into CreateThread?
+je retry_walk                  // yes -> overshot, try again
+bc watch_addr
+sti
+
+// OEP is reached via the SECOND indirect call ("FF D?") from here.
+find_oep_call:
+find cip, "FF D?"
+cmp $result, 0
+je oep_not_found
+find $result + 0x1, "FF D?"
+cmp $result, 0
+je oep_not_found
+watch_addr = $result
+bp watch_addr
+erun
+cmp cip, watch_addr
+je oep_found
+// landed elsewhere -> fall through and retry the walk
+
+retry_walk:
+bc watch_addr
+cmp cip, ct_entry
+je walk_from_ct
+erun
+jmp walk_from_ct
+
+oep_not_found:
+bc watch_addr
+erun
+cmp cip, ct_entry
+je walk_from_ct
+msg "Couldn't find the OEP."
+ret
+
+oep_found:
+bc
+sti
+cmt cip, "<--- OEP is here"
+bph cip
+msg "Found OEP @ {p:cip} and commented the address. :] booya"
+ret
+
+
+//============================================================================
+// No redirect stubs matched
+//============================================================================
+no_stubs_found:
+msg "No redirect stubs matched the pattern (scan gave up after 200 tries)."
+ret
