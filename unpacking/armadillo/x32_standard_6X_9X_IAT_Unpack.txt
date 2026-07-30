@@ -54,6 +54,12 @@ sti
 cmp scan_attempts, 200
 je no_stubs_found
 scan_attempts = scan_attempts + 0x1
+
+//guard: if cip is null, gives error
+region = mem.base(cip)
+cmp region, 0
+je find_stubs
+
 findall mem.base(cip), "E9 ?? ?? ?? ?? 83 B? ?? ?? ?? ?? 00 75 44"
 cmp $result, 0
 je find_stubs
